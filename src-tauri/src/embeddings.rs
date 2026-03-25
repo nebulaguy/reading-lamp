@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use crate::epub_parser::BookChunk;
 
-/// Embedding vector (Gemini text-embedding-004 produces 768-dimensional vectors)
+/// Embedding vector (Gemini text-embedding-005 produces 768-dimensional vectors)
 pub type Embedding = Vec<f32>;
 
 /// A chunk with its embedding
@@ -103,7 +103,7 @@ pub async fn get_embedding(text: &str, api_key: &str) -> Result<Embedding, Strin
     for attempt in 0..3 {
         let response = client
             .post(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={}",
+                "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-005:embedContent?key={}",
                 api_key
             ))
             .json(&serde_json::json!({
@@ -171,7 +171,7 @@ pub async fn embed_chunks(chunks: &[BookChunk], api_key: &str) -> Result<Vec<Emb
                     &c.text
                 };
                 serde_json::json!({
-                    "model": "models/text-embedding-004",
+                    "model": "models/text-embedding-005",
                     "content": {
                         "parts": [{"text": text}]
                     }
@@ -180,7 +180,7 @@ pub async fn embed_chunks(chunks: &[BookChunk], api_key: &str) -> Result<Vec<Emb
 
             let response = client
                 .post(format!(
-                    "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={}",
+                    "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-005:batchEmbedContents?key={}",
                     api_key
                 ))
                 .json(&serde_json::json!({

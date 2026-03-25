@@ -64,6 +64,9 @@ regex = "1"
 # Temp directory for search index
 tempfile = "3"
 
+# Base64 encoding for cover images
+base64 = "0.22"
+
 # Cross-platform directories
 dirs = "5"
 window-vibrancy = "0.7.1"

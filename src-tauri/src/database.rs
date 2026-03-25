@@ -2,6 +2,7 @@ use rusqlite::{Connection, params};
 use std::path::PathBuf;
 use crate::epub_parser::{BookChunk, ParsedBook, ParsedChapter};
 use crate::embeddings::{EmbeddedChunk, Embedding};
+use base64::Engine;
 
 /// Get the database path in the app data directory
 pub fn get_db_path() -> PathBuf {
@@ -77,6 +78,20 @@ pub fn init_db(conn: &Connection) -> Result<(), String> {
         );
         "
     ).map_err(|e| format!("Failed to initialize database: {}", e))?;
+
+    // Migration: add cover columns if they don't exist
+    let has_cover_col: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('books') WHERE name='cover_image'",
+        [],
+        |row| row.get::<_, i64>(0),
+    ).map(|c| c > 0).unwrap_or(false);
+
+    if !has_cover_col {
+        conn.execute_batch("
+            ALTER TABLE books ADD COLUMN cover_image BLOB;
+            ALTER TABLE books ADD COLUMN cover_mime TEXT;
+        ").map_err(|e| format!("Failed to add cover columns: {}", e))?;
+    }
     
     Ok(())
 }
@@ -135,9 +150,9 @@ pub fn save_book(conn: &Connection, book: &ParsedBook) -> Result<(), String> {
     // We use a closure to handle the operations so we can rollback on error
     let result = (|| -> Result<(), String> {
         conn.execute(
-            "INSERT OR REPLACE INTO books (id, title, author, filepath, content_hash, total_characters) 
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![book.id, book.title, book.author, book.filepath, book.content_hash, book.total_characters as i64],
+            "INSERT OR REPLACE INTO books (id, title, author, filepath, content_hash, total_characters, cover_image, cover_mime) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![book.id, book.title, book.author, book.filepath, book.content_hash, book.total_characters as i64, book.cover_image, book.cover_mime],
         ).map_err(|e| format!("Failed to save book: {}", e))?;
         
         // Save chapters
@@ -283,6 +298,8 @@ pub fn load_book(conn: &Connection, book_id: &str) -> Result<ParsedBook, String>
         chapters,
         chunks,
         total_characters: total_characters as usize,
+        cover_image: None,
+        cover_mime: None,
     })
 }
 
@@ -421,6 +438,7 @@ pub struct CachedBookSummary {
     pub total_chapters: usize,
     pub reading_progress: f32, // 0.0 to 1.0
     pub has_embeddings: bool,
+    pub cover_image_url: Option<String>,
 }
 
 /// Load all cached books with their reading progress
@@ -429,13 +447,25 @@ pub fn load_all_books(conn: &Connection) -> Result<Vec<CachedBookSummary>, Strin
         "SELECT b.id, b.title, b.author, 
                 (SELECT COUNT(*) FROM chapters WHERE book_id = b.id) as chapter_count,
                 COALESCE(rs.high_water_percent, 0) as progress,
-                (SELECT COUNT(*) > 0 FROM embeddings WHERE book_id = b.id) as has_emb
+                (SELECT COUNT(*) > 0 FROM embeddings WHERE book_id = b.id) as has_emb,
+                b.cover_image, b.cover_mime
          FROM books b
          LEFT JOIN reading_state rs ON b.id = rs.book_id
          ORDER BY COALESCE(rs.updated_at, b.created_at) DESC"
     ).map_err(|e| format!("Failed to prepare query: {}", e))?;
     
     let books: Vec<CachedBookSummary> = stmt.query_map([], |row| {
+        let cover_bytes: Option<Vec<u8>> = row.get(6)?;
+        let cover_mime: Option<String> = row.get(7)?;
+        
+        let cover_image_url = match (cover_bytes, cover_mime) {
+            (Some(bytes), Some(mime)) if !bytes.is_empty() => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                Some(format!("data:{};base64,{}", mime, b64))
+            }
+            _ => None,
+        };
+
         Ok(CachedBookSummary {
             id: row.get(0)?,
             title: row.get(1)?,
@@ -443,6 +473,7 @@ pub fn load_all_books(conn: &Connection) -> Result<Vec<CachedBookSummary>, Strin
             total_chapters: row.get::<_, i64>(3)? as usize,
             reading_progress: row.get::<_, f64>(4)? as f32,
             has_embeddings: row.get::<_, i64>(5)? > 0,
+            cover_image_url,
         })
     }).map_err(|e| format!("Failed to query books: {}", e))?
     .filter_map(|r| r.ok())

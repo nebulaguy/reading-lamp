@@ -73,5 +73,6 @@ export interface CachedBook {
   totalChapters: number;
   readingProgress: number;
   hasEmbeddings: boolean;
+  coverImageUrl?: string;
 }
 

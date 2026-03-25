@@ -28,6 +28,8 @@ pub struct ParsedBook {
     pub chapters: Vec<ParsedChapter>,
     pub chunks: Vec<BookChunk>,
     pub total_characters: usize,
+    pub cover_image: Option<Vec<u8>>,
+    pub cover_mime: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,6 +147,9 @@ pub fn parse_epub(filepath: &str) -> Result<ParsedBook, String> {
         return Err("No readable content found in EPUB".to_string());
     }
 
+    // Extract cover image
+    let (cover_image, cover_mime) = extract_cover(filepath);
+
     Ok(ParsedBook {
         id: book_id,
         title,
@@ -154,7 +159,45 @@ pub fn parse_epub(filepath: &str) -> Result<ParsedBook, String> {
         chapters,
         chunks: all_chunks,
         total_characters: global_offset,
+        cover_image,
+        cover_mime,
     })
+}
+
+/// Extract cover image from an EPUB file
+fn extract_cover(filepath: &str) -> (Option<Vec<u8>>, Option<String>) {
+    let mut doc = match EpubDoc::new(filepath) {
+        Ok(d) => d,
+        Err(_) => return (None, None),
+    };
+
+    // Try get_cover() which returns (bytes, mime)
+    if let Some((bytes, mime)) = doc.get_cover() {
+        if !bytes.is_empty() {
+            return (Some(bytes), Some(mime));
+        }
+    }
+
+    // Fallback: look for a resource with id containing "cover" and image mime type
+    let cover_ids: Vec<String> = doc.resources.keys()
+        .filter(|k| k.to_lowercase().contains("cover"))
+        .cloned()
+        .collect();
+    
+    for id in cover_ids {
+        if let Some(resource) = doc.resources.get(&id) {
+            let mime = resource.mime.clone();
+            if mime.starts_with("image/") {
+                if let Some((bytes, _)) = doc.get_resource(&id) {
+                    if !bytes.is_empty() {
+                        return (Some(bytes), Some(mime));
+                    }
+                }
+            }
+        }
+    }
+
+    (None, None)
 }
 
 fn html_to_text(html: &str) -> String {

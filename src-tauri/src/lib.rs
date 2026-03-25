@@ -423,11 +423,86 @@ fn set_gemini_model(model: String, state: State<AppState>) -> Result<(), String>
     Ok(())
 }
 
+/// Get the surrounding scene context for a passage (chunks before + after the matching chunk)
+fn get_surrounding_context(
+    passage: &str,
+    state: &State<'_, AppState>,
+) -> String {
+    let book_guard = state.current_book.lock().unwrap();
+    let book = match &*book_guard {
+        Some(b) => b,
+        None => return String::new(),
+    };
+
+    if passage.trim().is_empty() || book.chunks.is_empty() {
+        return String::new();
+    }
+
+    // Find which chunk contains the passage (using normalized substring match)
+    let passage_lower = passage.to_lowercase();
+    let matched_idx = book.chunks.iter().position(|chunk| {
+        chunk.text.to_lowercase().contains(&passage_lower)
+    });
+
+    // If exact match fails, try word overlap
+    let matched_idx = matched_idx.or_else(|| {
+        let passage_words: Vec<&str> = passage_lower.split_whitespace()
+            .filter(|w| w.len() > 3)
+            .collect();
+        if passage_words.is_empty() { return None; }
+
+        let mut best: Option<(usize, f32)> = None;
+        for (i, chunk) in book.chunks.iter().enumerate() {
+            let chunk_lower = chunk.text.to_lowercase();
+            let overlap = passage_words.iter()
+                .filter(|w| chunk_lower.contains(*w))
+                .count() as f32 / passage_words.len() as f32;
+            if overlap > 0.6 {
+                if best.is_none() || overlap > best.unwrap().1 {
+                    best = Some((i, overlap));
+                }
+            }
+        }
+        best.map(|(i, _)| i)
+    });
+
+    let matched_idx = match matched_idx {
+        Some(i) => i,
+        None => return String::new(),
+    };
+
+    // Gather surrounding chunks: 1 before, the match, 1 after
+    let mut scene_parts: Vec<String> = Vec::new();
+
+    // Previous chunk (same chapter only for coherence)
+    if matched_idx > 0 {
+        let prev = &book.chunks[matched_idx - 1];
+        if prev.chapter_index == book.chunks[matched_idx].chapter_index {
+            scene_parts.push(prev.text.clone());
+        }
+    }
+
+    // The matched chunk itself
+    scene_parts.push(book.chunks[matched_idx].text.clone());
+
+    // Next chunk (same chapter only)
+    if matched_idx + 1 < book.chunks.len() {
+        let next = &book.chunks[matched_idx + 1];
+        if next.chapter_index == book.chunks[matched_idx].chapter_index {
+            scene_parts.push(next.text.clone());
+        }
+    }
+
+    let chapter_title = &book.chunks[matched_idx].chapter_title;
+    format!("SCENE CONTEXT (from \"{}\"):\n\"\"\"\n{}\n\"\"\"", chapter_title, scene_parts.join("\n"))
+}
+
 /// Get relevant chunks using semantic search
 async fn get_semantic_context(
     query: &str,
     max_chapter: usize,
     top_k: usize,
+    total_characters: usize,
     state: &State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
     let api_key = {
@@ -439,7 +514,7 @@ async fn get_semantic_context(
     
     if !embeddings_ready {
         // Fall back to keyword search
-        return Ok(get_keyword_context(query, max_chapter, top_k, state));
+        return Ok(get_keyword_context(query, max_chapter, top_k, total_characters, state));
     }
     
     // Get query embedding
@@ -450,12 +525,17 @@ async fn get_semantic_context(
     let similar = store.find_similar(&query_embedding, max_chapter, top_k);
     
     Ok(similar.iter()
-        .map(|c| format!("[{}]: {}", c.chapter_title, c.text))
+        .map(|c| {
+            let percent = if total_characters > 0 {
+                (c.start_offset as f32 / total_characters as f32 * 100.0) as u32
+            } else { 0 };
+            format!("PASSAGE ({}, {}% through book):\n\"{}\"", c.chapter_title, percent, c.text)
+        })
         .collect())
 }
 
 /// Fallback keyword-based context retrieval
-fn get_keyword_context(query: &str, max_chapter: usize, top_k: usize, state: &State<'_, AppState>) -> Vec<String> {
+fn get_keyword_context(query: &str, max_chapter: usize, top_k: usize, total_characters: usize, state: &State<'_, AppState>) -> Vec<String> {
     let book_guard = state.current_book.lock().unwrap();
     let book = match &*book_guard {
         Some(b) => b,
@@ -490,8 +570,79 @@ fn get_keyword_context(query: &str, max_chapter: usize, top_k: usize, state: &St
     
     scored.into_iter()
         .take(top_k)
-        .map(|(_, chunk)| format!("[{}]: {}", chunk.chapter_title, chunk.text))
+        .map(|(_, chunk)| {
+            let percent = if total_characters > 0 {
+                (chunk.start_offset as f32 / total_characters as f32 * 100.0) as u32
+            } else { 0 };
+            format!("PASSAGE ({}, {}% through book):\n\"{}\"", chunk.chapter_title, percent, chunk.text)
+        })
         .collect()
+}
+
+/// Build the system prompt for the AI, shared between streaming and non-streaming endpoints
+fn build_system_prompt(book_context: &BookContext, context_section: &str, scene_section: &str) -> String {
+    let progress_pct = (book_context.percent_complete * 100.0) as u32;
+    
+    if book_context.spoiler_mode_enabled {
+        format!(
+            r#"You are a literary analysis assistant for the book "{title}" by {author}.
+
+SPOILER RULES (CRITICAL):
+- The reader is at: {chapter} ({pct}% through the book)
+- NEVER reveal plot points, character developments, twists, or events AFTER this point
+- If asked about something beyond their position, say you can't discuss it yet
+
+READING POSITION:
+- Book: "{title}" by {author}
+- Current Chapter: {chapter}
+- Progress: {pct}%
+
+ANALYSIS GUIDELINES:
+1. **Speaker Identification**: DO NOT GUESS. For identifying speakers, ONLY use the SCENE CONTEXT section (the text immediately surrounding the quote) and dialogue tags within it. Do NOT use the RELEVANT PASSAGES section for speaker identification — those come from other parts of the book and will mislead you. Only confirm a speaker if you can point to a specific cue in the scene context. If the scene context does not make the speaker clear, say "The speaker is not explicitly identified in this passage." Getting the speaker wrong is worse than not identifying them.
+2. **Concrete Thematic Analysis**: Name specific themes explicitly (e.g., "This connects to the theme of isolation that {author} has been building since..."). Do NOT make vague statements like "this is interesting" — explain WHY it matters to the story.
+3. **Supporting Quotes**: When making a claim about the text, support it with a direct quote from the provided passages. Format as: As [Character/narrator] says in [Chapter]: "..."
+4. **Connections**: Draw connections between the current passage and earlier events, character arcs, or motifs that have appeared SO FAR in the book. Be specific about where those connections appear.
+5. **Literary Technique**: When relevant, identify the literary technique being used (metaphor, foreshadowing, irony, unreliable narration, etc.) and explain its effect.
+{scene}{context}
+
+Keep responses focused and substantive. Avoid filler. Every sentence should add analytical value."#,
+            title = book_context.title,
+            author = book_context.author,
+            chapter = book_context.current_chapter,
+            pct = progress_pct,
+            scene = scene_section,
+            context = context_section,
+        )
+    } else {
+        format!(
+            r#"You are a literary analysis assistant for the book "{title}" by {author}.
+
+SPOILER MODE: OFF — The reader has read the book before or doesn't mind spoilers.
+- You may discuss ANY part of the book freely, including the ending
+- The reader is currently at: {chapter} ({pct}% through) — use this to contextualize your analysis
+- When referencing events, note whether they are before or after the reader's current position
+
+READING POSITION:
+- Book: "{title}" by {author}
+- Current Position: {chapter} ({pct}%)
+
+ANALYSIS GUIDELINES:
+1. **Speaker Identification**: DO NOT GUESS. For identifying speakers, ONLY use the SCENE CONTEXT section (the text immediately surrounding the quote) and dialogue tags within it. Do NOT use the RELEVANT PASSAGES section for speaker identification — those come from other parts of the book and will mislead you. Only confirm a speaker if you can point to a specific cue in the scene context. If the scene context does not make the speaker clear, say "The speaker is not explicitly identified in this passage." Getting the speaker wrong is worse than not identifying them.
+2. **Concrete Thematic Analysis**: Name specific themes explicitly (e.g., "This connects to the theme of moral ambiguity that runs throughout the novel..."). Do NOT make vague statements. Explain WHY the passage matters to the work as a whole.
+3. **Supporting Quotes**: Back up your claims with direct quotes from the provided passages. Format as: As [Character/narrator] says in [Chapter]: "..."
+4. **Full Arc Connections**: Connect the passage to the complete arc of the book — foreshadowing, callbacks, parallel scenes, and character development. Be specific about where those connections appear (e.g., "This mirrors the scene in [Chapter] where...").
+5. **Literary Technique**: Name the literary techniques at work (symbolism, irony, motif, parallel structure, etc.) and explain their effect on the reader.
+{scene}{context}
+
+Keep responses focused and substantive. Avoid filler. Every sentence should add analytical value."#,
+            title = book_context.title,
+            author = book_context.author,
+            chapter = book_context.current_chapter,
+            pct = progress_pct,
+            scene = scene_section,
+            context = context_section,
+        )
+    }
 }
 
 #[tauri::command]
@@ -506,89 +657,45 @@ async fn send_chat_message(
         key_guard.clone().ok_or("No API key configured. Please add your Gemini API key in Settings.")?
     };
 
+    // Get total characters for position calculation
+    let total_characters = {
+        let book_guard = state.current_book.lock().unwrap();
+        book_guard.as_ref().map(|b| b.total_characters).unwrap_or(0)
+    };
+
     // Get relevant context using semantic search if available
     let last_message = messages.last().map(|m| m.content.as_str()).unwrap_or("");
     let relevant_context = get_semantic_context(
         last_message,
         book_context.spoiler_boundary_chapter,
         5,
+        total_characters,
         &state,
     ).await.unwrap_or_else(|_| Vec::new());
 
+    // Get scene context around the passage being discussed
+    let scene_context = get_surrounding_context(
+        &book_context.passage_being_discussed,
+        &state,
+    );
+
     let context_section = if !relevant_context.is_empty() {
         format!(
-            "\n\nRELEVANT PASSAGES FROM THE BOOK (use these to inform your response):\n{}",
+            "\n\nRELEVANT PASSAGES FROM THE BOOK:\n{}",
             relevant_context.join("\n\n")
         )
     } else {
         String::new()
     };
 
-    // Build system prompt with book context and retrieved passages
-    let system_prompt = if book_context.spoiler_mode_enabled {
-        format!(
-            r#"You are a literary analysis assistant helping a reader understand and discuss the book "{}" by {}.
-
-CRITICAL SPOILER RULES:
-- The reader is currently at: {} ({}% through the book)
-- You MUST NOT reveal ANY plot points, character developments, or events that occur AFTER this point
-- If the reader asks about something you cannot discuss without spoilers, politely explain you can't discuss that yet
-
-CURRENT CONTEXT:
-- Book: {} by {}
-- Current Chapter: {}
-- Reading Progress: {}%
-{}
-When discussing passages or themes:
-1. Focus on literary analysis, character development, and themes revealed SO FAR
-2. Draw connections to earlier parts of the book using the relevant passages provided
-3. Encourage critical thinking without revealing future events
-4. Quote directly from the provided passages when relevant to support your analysis
-
-Be concise but insightful. Write in a friendly, engaging tone."#,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            context_section,
-        )
+    let scene_section = if !scene_context.is_empty() {
+        format!("\n\n{}", scene_context)
     } else {
-        // Spoiler-free mode: AI has full context but prioritizes current position for relevance
-        format!(
-            r#"You are a literary analysis assistant helping a reader discuss the book "{}" by {}.
-
-SPOILER MODE: OFF (Reader has read the book before or doesn't mind spoilers)
-- You have full access to discuss ANY part of the book including the ending
-- The reader is currently at: {} ({}% through) - use this for context about what they're revisiting
-- When possible, connect themes and events to where they currently are in the book
-- If referencing events, mention whether they're from before or after the reader's current position
-
-CURRENT CONTEXT:
-- Book: {} by {}
-- Current Position: {} ({}%)
-{}
-When discussing the book:
-1. Feel free to discuss the complete work including foreshadowing, callbacks, and full character arcs
-2. Prioritize examples and analysis relevant to where the reader currently is when applicable
-3. Note when discussing events: "Earlier in the book..." or "Later you'll see..." for clarity
-4. Quote from provided passages when relevant
-
-Be insightful and engaging. This reader wants the full literary experience."#,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            context_section,
-        )
+        String::new()
     };
+
+    // Build system prompt with book context and retrieved passages
+    let system_prompt = build_system_prompt(&book_context, &context_section, &scene_section);
 
     // Build conversation for Gemini API
     let mut gemini_contents: Vec<serde_json::Value> = vec![];
@@ -599,7 +706,7 @@ Be insightful and engaging. This reader wants the full literary experience."#,
     }));
     gemini_contents.push(serde_json::json!({
         "role": "model",
-        "parts": [{"text": "I understand. I'll help you discuss this book while being careful not to reveal anything beyond your current reading position. I have access to relevant passages from what you've read so far. What would you like to explore?"}]
+        "parts": [{"text": "Understood. I'm ready to help you analyze this book with concrete, thematic analysis grounded in the text. What would you like to explore?"}]
     }));
 
     // Add conversation history
@@ -627,7 +734,7 @@ Be insightful and engaging. This reader wants the full literary experience."#,
                 "contents": gemini_contents,
                 "generationConfig": {
                     "temperature": 0.7,
-                    "maxOutputTokens": 1024,
+                    "maxOutputTokens": 4096,
                 }
             }))
             .send()
@@ -678,89 +785,45 @@ async fn send_chat_message_stream(
         key_guard.clone().ok_or("No API key configured. Please add your Gemini API key in Settings.")?
     };
 
+    // Get total characters for position calculation
+    let total_characters = {
+        let book_guard = state.current_book.lock().unwrap();
+        book_guard.as_ref().map(|b| b.total_characters).unwrap_or(0)
+    };
+
     // Get relevant context using semantic search if available
     let last_message = messages.last().map(|m| m.content.as_str()).unwrap_or("");
     let relevant_context = get_semantic_context(
         last_message,
         book_context.spoiler_boundary_chapter,
         5,
+        total_characters,
         &state,
     ).await.unwrap_or_else(|_| Vec::new());
 
+    // Get scene context around the passage being discussed
+    let scene_context = get_surrounding_context(
+        &book_context.passage_being_discussed,
+        &state,
+    );
+
     let context_section = if !relevant_context.is_empty() {
         format!(
-            "\n\nRELEVANT PASSAGES FROM THE BOOK (use these to inform your response):\n{}",
+            "\n\nRELEVANT PASSAGES FROM THE BOOK:\n{}",
             relevant_context.join("\n\n")
         )
     } else {
         String::new()
     };
 
-    // Build system prompt with book context and retrieved passages
-    let system_prompt = if book_context.spoiler_mode_enabled {
-        format!(
-            r#"You are a literary analysis assistant helping a reader understand and discuss the book "{}" by {}.
-
-CRITICAL SPOILER RULES:
-- The reader is currently at: {} ({}% through the book)
-- You MUST NOT reveal ANY plot points, character developments, or events that occur AFTER this point
-- If the reader asks about something you cannot discuss without spoilers, politely explain you can't discuss that yet
-
-CURRENT CONTEXT:
-- Book: {} by {}
-- Current Chapter: {}
-- Reading Progress: {}%
-{}
-When discussing passages or themes:
-1. Focus on literary analysis, character development, and themes revealed SO FAR
-2. Draw connections to earlier parts of the book using the relevant passages provided
-3. Encourage critical thinking without revealing future events
-4. Quote directly from the provided passages when relevant to support your analysis
-
-Be concise but insightful. Write in a friendly, engaging tone."#,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            context_section,
-        )
+    let scene_section = if !scene_context.is_empty() {
+        format!("\n\n{}", scene_context)
     } else {
-        // Spoiler-free mode: AI has full context but prioritizes current position for relevance
-        format!(
-            r#"You are a literary analysis assistant helping a reader discuss the book "{}" by {}.
-
-SPOILER MODE: OFF (Reader has read the book before or doesn't mind spoilers)
-- You have full access to discuss ANY part of the book including the ending
-- The reader is currently at: {} ({}% through) - use this for context about what they're revisiting
-- When possible, connect themes and events to where they currently are in the book
-- If referencing events, mention whether they're from before or after the reader's current position
-
-CURRENT CONTEXT:
-- Book: {} by {}
-- Current Position: {} ({}%)
-{}
-When discussing the book:
-1. Feel free to discuss the complete work including foreshadowing, callbacks, and full character arcs
-2. Prioritize examples and analysis relevant to where the reader currently is when applicable
-3. Note when discussing events: "Earlier in the book..." or "Later you'll see..." for clarity
-4. Quote from provided passages when relevant
-
-Be insightful and engaging. This reader wants the full literary experience."#,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            book_context.title,
-            book_context.author,
-            book_context.current_chapter,
-            (book_context.percent_complete * 100.0) as u32,
-            context_section,
-        )
+        String::new()
     };
+
+    // Build system prompt with book context and retrieved passages
+    let system_prompt = build_system_prompt(&book_context, &context_section, &scene_section);
 
     // Build conversation for Gemini API
     let mut gemini_contents: Vec<serde_json::Value> = vec![];
@@ -771,7 +834,7 @@ Be insightful and engaging. This reader wants the full literary experience."#,
     }));
     gemini_contents.push(serde_json::json!({
         "role": "model",
-        "parts": [{"text": "I understand. I'll help you discuss this book while being careful not to reveal anything beyond your current reading position. I have access to relevant passages from what you've read so far. What would you like to explore?"}]
+        "parts": [{"text": "Understood. I'm ready to help you analyze this book with concrete, thematic analysis grounded in the text. What would you like to explore?"}]
     }));
 
     // Add conversation history
@@ -798,7 +861,7 @@ Be insightful and engaging. This reader wants the full literary experience."#,
             "contents": gemini_contents,
             "generationConfig": {
                 "temperature": 0.7,
-                "maxOutputTokens": 1024,
+                "maxOutputTokens": 4096,
             }
         }))
         .send()
@@ -821,33 +884,34 @@ Be insightful and engaging. This reader wants the full literary experience."#,
 
     // Stream the response - Gemini returns JSON objects as chunks
     let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-    let mut brace_count = 0;
-    let mut object_start = 0;
-    let mut in_string = false;
-    let mut escape_next = false;
+    let mut buffer = Vec::new(); // Use a byte buffer to handle potential UTF-8 splits
     
     while let Some(chunk_result) = stream.next().await {
         match chunk_result {
             Ok(chunk) => {
-                let chunk_str = String::from_utf8_lossy(&chunk);
+                // Append new bytes to our buffer
+                buffer.extend_from_slice(&chunk);
                 
-                // Process character by character to find complete JSON objects
-                for ch in chunk_str.chars() {
-                    let pos = buffer.len();
-                    buffer.push(ch);
-                    
+                // Process the buffer, looking for complete JSON objects (balanced braces)
+                let mut processed_len = 0;
+                let mut brace_count = 0;
+                let mut in_string = false;
+                let mut escape_next = false;
+                let mut object_start: Option<usize> = None;
+                
+                // Iterate through the buffer to find boundaries
+                for (i, &byte) in buffer.iter().enumerate() {
                     if escape_next {
                         escape_next = false;
                         continue;
                     }
                     
-                    if ch == '\\' && in_string {
+                    if byte == b'\\' && in_string {
                         escape_next = true;
                         continue;
                     }
                     
-                    if ch == '"' {
+                    if byte == b'"' {
                         in_string = !in_string;
                         continue;
                     }
@@ -856,25 +920,43 @@ Be insightful and engaging. This reader wants the full literary experience."#,
                         continue;
                     }
                     
-                    if ch == '{' {
+                    if byte == b'{' {
                         if brace_count == 0 {
-                            object_start = pos;
+                            object_start = Some(i);
                         }
                         brace_count += 1;
-                    } else if ch == '}' {
+                    } else if byte == b'}' {
                         brace_count -= 1;
-                        if brace_count == 0 {
-                            // We have a complete JSON object
-                            let json_str = &buffer[object_start..=pos];
+                        
+                        if brace_count == 0 && object_start.is_some() {
+                            // We have a complete JSON object!
+                            let start = object_start.unwrap();
+                            let end = i + 1; // inclusive
                             
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
-                                if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
-                                    println!("Streaming chunk: {}", text);
-                                    let _ = app.emit(&format!("chat-stream:{}", session_id), text);
+                            // Try to parse this slice as JSON
+                            if let Ok(json_str) = std::str::from_utf8(&buffer[start..end]) {
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(json_str) {
+                                    if let Some(text) = json["candidates"][0]["content"]["parts"][0]["text"].as_str() {
+                                        // println!("Streaming chunk ({} bytes): {}", end - start, text);
+                                        let _ = app.emit(&format!("chat-stream:{}", session_id), text);
+                                    }
+                                } else {
+                                    println!("Failed to parse JSON chunk: {}", json_str);
                                 }
+                            } else {
+                                println!("Invalid UTF-8 in JSON chunk range");
                             }
+                            
+                            // Reset for next object
+                            object_start = None;
+                            processed_len = end;
                         }
                     }
+                }
+                
+                // Remove processed bytes from the buffer
+                if processed_len > 0 {
+                    buffer.drain(0..processed_len);
                 }
             }
             Err(e) => {
@@ -886,7 +968,6 @@ Be insightful and engaging. This reader wants the full literary experience."#,
     }
     
     println!("Stream completed for session: {}", session_id);
-    // Signal completion
     let _ = app.emit(&format!("chat-stream-end:{}", session_id), ());
     
     Ok(())
@@ -894,6 +975,7 @@ Be insightful and engaging. This reader wants the full literary experience."#,
 
 /// Response type for cached books list
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct CachedBook {
     id: String,
     title: String,
@@ -901,6 +983,7 @@ struct CachedBook {
     total_chapters: usize,
     reading_progress: f32,
     has_embeddings: bool,
+    cover_image_url: Option<String>,
 }
 
 /// Get list of all cached books
@@ -916,6 +999,7 @@ fn get_cached_books(state: State<'_, AppState>) -> Result<Vec<CachedBook>, Strin
         total_chapters: b.total_chapters,
         reading_progress: b.reading_progress,
         has_embeddings: b.has_embeddings,
+        cover_image_url: b.cover_image_url,
     }).collect())
 }
 
